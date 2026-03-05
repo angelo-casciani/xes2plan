@@ -1,0 +1,577 @@
+import os
+import numpy as np
+from collections import defaultdict
+import pm4py
+import random
+from decision_mining import discover_all_decision_rules, get_attribute_domains
+import utils
+
+SEED = 42
+random.seed(SEED)
+os.environ['PYTHONHASHSEED'] = str(SEED)
+np.random.seed(SEED)
+
+class Parser:
+    IGNORED_ATTRIBUTES = {'case:concept:name', 'concept:name', 'time:timestamp', 'lifecycle:transition', 'org:resource', 'org:group', 'variant-index', 'Resource', 'org:role'}
+    MIN_PROBABILITY_THRESHOLD = 0.1
+    STRONG_PROBABILITY_THRESHOLD = 0.2
+    MIN_SUPPORT_COUNT = 1
+    MIN_SUPPORT_FOR_RELATIONSHIPS = 1
+
+    DISCOVERY_ALGORITHMS = {
+        'alpha': pm4py.discovery.discover_petri_net_alpha,
+        'inductive': pm4py.discovery.discover_petri_net_inductive,
+        'heuristics': pm4py.discovery.discover_petri_net_heuristics,
+        'ilp': pm4py.discovery.discover_petri_net_ilp
+    }
+
+    def __init__(self, log_name, coverage_percentage, discovery_algorithm='inductive', intervals=None,
+                 use_activity_classifier=False):
+        """
+        Initialize the Parser with a specified discovery algorithm.
+        
+        Args:
+            log_name: Name of the XES event log file
+            coverage_percentage: Minimum cumulative coverage percentage for variant filtering
+            discovery_algorithm: Algorithm to use for Petri net discovery ('alpha', 'inductive', 'heuristics', 'ilp')
+            intervals: Intervals from decision mining for discretization
+            use_activity_classifier: If True, combine concept:name with lifecycle:transition
+                                     to create activity names (Activity classifier). This is needed
+                                     for logs where events are not uniquely identified by concept:name
+                                     alone (e.g., BPIC 2013). Default is False.
+        """
+        if discovery_algorithm not in self.DISCOVERY_ALGORITHMS:
+            raise ValueError(f"Unsupported discovery algorithm: {discovery_algorithm}. "
+                           f"Supported algorithms: {list(self.DISCOVERY_ALGORITHMS.keys())}")
+        self.intervals = intervals or {}
+        self.discovery_algorithm = discovery_algorithm
+        self.use_activity_classifier = use_activity_classifier
+        self.log_path = os.path.join(os.path.dirname(__file__), '..', 'logs', log_name)
+        self.log = self._load_and_filter_log(coverage_percentage)
+        self._split_train_test()
+        self._discover_petri_net()
+        self._extract_basic_properties()
+        self._initialize_attributes()
+        self._compute_structure_and_probabilities()
+
+    def _split_train_test(self):
+        self.train_df, self.test_df = pm4py.split_train_test(self.log, train_percentage=0.8)
+        self.log = self.train_df
+
+    def _discover_petri_net(self):
+        discovery_function = self.DISCOVERY_ALGORITHMS[self.discovery_algorithm]
+        try:
+            self.petrinet, self.initial_marking, self.final_marking = discovery_function(self.log)
+            self.transitions = self.petrinet.transitions
+            self.places = self.petrinet.places
+            self.edges = self.petrinet.arcs
+            #pm4py.vis.view_petri_net(self.petrinet, self.initial_marking, self.final_marking)
+            print(f"Successfully discovered Petri net using {self.discovery_algorithm} algorithm")
+        except Exception as e:
+            print(f"Error discovering Petri net with {self.discovery_algorithm} algorithm: {e}")
+            
+
+    def _extract_basic_properties(self):
+        self.silent_transitions = []
+        activities_set = set()
+        tau_counter = 1
+        
+        for transition in self.transitions:
+            if transition.label is None: # Create a tau action for a silent transition
+                tau_name = f"tau_{tau_counter}"
+                self.silent_transitions.append((transition, tau_name))
+                activities_set.add(tau_name)
+                tau_counter += 1
+            else: # Regular labeled transition
+                sanitized_name = utils.sanitize_name(transition.label)
+                activities_set.add(sanitized_name)
+        
+        self.activities = activities_set
+        self.start_activities = {utils.sanitize_name(activity): freq 
+                               for activity, freq in pm4py.get_start_activities(self.full_log).items()}
+        self.end_activities = {utils.sanitize_name(activity): freq 
+                             for activity, freq in pm4py.get_end_activities(self.full_log).items()}
+
+
+    def _initialize_attributes(self):
+        self.attributes = {utils.sanitize_name(attr) for attr in pm4py.get_event_attributes(self.full_log) 
+                          if attr not in Parser.IGNORED_ATTRIBUTES}
+        self.attribute_categories = self._categorize_attributes()
+
+    def _compute_structure_and_probabilities(self):
+        self.predecessors = self.extract_predecessors()
+        self.decision_points_probabilities = self.compute_decision_points_probabilities()
+        self.parallels = self.identify_parallels()
+        self.direct_transition_graph = self._build_direct_transition_graph()
+        # print("Probabilities at decision points:", self.decision_points_probabilities)
+        # print("Graph of direct transitions:", dict(self.direct_transition_graph))
+        
+        # Run decision mining to get attribute domains
+        # Pass the already-transformed log (with Activity classifier applied if enabled)
+        rules, intervals, samples = discover_all_decision_rules(self.log_path, log=self.full_log)
+        self.attribute_domains = get_attribute_domains(samples, intervals)
+        self.decision_samples = samples
+        # Update intervals with the ones discovered from decision mining
+        if intervals:
+            self.intervals = dict(intervals)  # Convert defaultdict to regular dict
+
+    def _load_and_filter_log(self, coverage_percentage):
+        log = pm4py.objects.log.importer.xes.importer.apply(self.log_path)
+        
+        if self.use_activity_classifier:
+            # When using Activity classifier, combine concept:name + lifecycle:transition
+            # This is needed for logs where events are not uniquely identified by concept:name
+            # alone (e.g., BPIC 2013)
+            for trace in log:
+                for event in trace:
+                    concept_name = event.get('concept:name', '')
+                    lifecycle = event.get('lifecycle:transition', '')
+                    if lifecycle:
+                        # Combine as "ActivityName (Lifecycle)" - e.g., "Accepted (In Progress)"
+                        event['concept:name'] = f"{concept_name} ({lifecycle})"
+            print("Using Activity classifier: combining concept:name + lifecycle:transition")
+        else:
+            # Filter full log for lifecycle (keep only 'complete' events)
+            try:
+                lifecycle_values = pm4py.get_event_attribute_values(log, 'lifecycle:transition')
+                if 'complete' in lifecycle_values:
+                    log = pm4py.filter_event_attribute_values(log, 'lifecycle:transition', 'complete')
+            except:
+                pass
+        
+        self.full_log = log  # Store full log for frequency computation
+        
+        try:
+            filtered_log = pm4py.filter_variants_by_coverage_percentage(log, coverage_percentage)
+            if len(filtered_log) > 0:
+                log = filtered_log
+            else:
+                print(f"Warning: Coverage filter removed all traces, using full log")
+        except Exception as e:
+            print(f"Warning: Coverage filtering failed: {e}, using full log")
+            
+        return log
+    
+    
+    def _categorize_attributes(self):
+        attr_categories = {}
+        
+        # Include trace (case) attributes
+        for attr in pm4py.get_trace_attributes(self.full_log):
+            sanitized_name = utils.sanitize_name(f"case:{attr}")
+            values = []
+            for trace in self.full_log:
+                if attr in trace.attributes:
+                    values.append(trace.attributes[attr])
+            if values:
+                if all(isinstance(val, bool) for val in values):
+                    attr_categories[sanitized_name] = 'boolean'
+                elif all(isinstance(val, (int, float)) and not isinstance(val, bool) for val in values):
+                    attr_categories[sanitized_name] = 'numerical'
+                else:
+                    attr_categories[sanitized_name] = 'categorical'
+        
+        # Include event attributes
+        for attr in pm4py.get_event_attributes(self.full_log):
+            if attr in Parser.IGNORED_ATTRIBUTES:
+                continue 
+            sanitized_name = utils.sanitize_name(attr)
+            values = pm4py.get_event_attribute_values(self.full_log, attr).keys()
+            if all(isinstance(val, bool) for val in values):
+                attr_categories[sanitized_name] = 'boolean'
+            elif all(isinstance(val, (int, float)) and not isinstance(val, bool) for val in values):
+                attr_categories[sanitized_name] = 'numerical'
+            else:
+                attr_categories[sanitized_name] = 'categorical'
+        
+        return attr_categories
+    
+    
+    def _get_place_outgoing_transitions(self):
+        place_outgoing_transitions = defaultdict(list)
+        for arc in self.edges:
+            source, target = arc.source, arc.target
+            if isinstance(source, pm4py.objects.petri_net.obj.PetriNet.Place) and \
+               isinstance(target, pm4py.objects.petri_net.obj.PetriNet.Transition):
+                place_outgoing_transitions[source].append(target)
+        return place_outgoing_transitions
+
+    def _get_transition_outgoing_places(self):
+        transition_outgoing_places = defaultdict(list)
+        for arc in self.edges:
+            source, target = arc.source, arc.target
+            if isinstance(source, pm4py.objects.petri_net.obj.PetriNet.Transition) and \
+               isinstance(target, pm4py.objects.petri_net.obj.PetriNet.Place):
+                transition_outgoing_places[source].append(target)
+        return transition_outgoing_places
+
+    def _compute_activity_frequencies(self):
+        df_counts = defaultdict(lambda: defaultdict(int))
+        for trace in self.full_log:
+            for i in range(len(trace) - 1):
+                current_activity = utils.sanitize_name(trace[i]["concept:name"])
+                next_activity = utils.sanitize_name(trace[i+1]["concept:name"])
+                df_counts[current_activity][next_activity] += 1
+        return df_counts
+
+    def _compute_decision_probabilities(self, decision_points, df_counts):
+        decision_probabilities = {}
+        for place, outgoing_transitions in decision_points.items():
+            all_transitions = [(t, self._get_activity_name_for_transition(t)) for t in outgoing_transitions]
+            place_probs = {}
+            incoming_activities = set()
+            for out_transition, out_label in all_transitions:
+                sanitized_out = utils.sanitize_name(out_label)
+                for pred in self.predecessors.get(sanitized_out, []):
+                    self._add_non_tau_predecessors(pred, incoming_activities)
+            incoming_activities = list(incoming_activities)
+            
+            transition_counts = defaultdict(int)
+            total_count = 0
+            for in_activity in incoming_activities:
+                for out_transition, out_label in all_transitions:
+                    sanitized_out = utils.sanitize_name(out_label)
+                    count = df_counts[in_activity].get(sanitized_out, 0)
+                    transition_counts[out_transition] += count
+                    total_count += count
+            
+            if total_count > 0:
+                for transition, count in transition_counts.items():
+                    probability = count / total_count
+                    action_name = self._get_activity_name_for_transition(transition)
+                    place_probs[action_name] = round(probability, 2)
+                if place_probs:
+                    decision_probabilities[place.name] = place_probs
+            else:
+                # Assign equal probabilities if no data available
+                num_transitions = len(all_transitions)
+                if num_transitions > 0:
+                    equal_prob = round(1.0 / num_transitions, 2)
+                    for out_transition, out_label in all_transitions:
+                        action_name = self._get_activity_name_for_transition(out_transition)
+                        place_probs[action_name] = equal_prob
+                    decision_probabilities[place.name] = place_probs
+
+        return decision_probabilities
+
+    def _add_non_tau_predecessors(self, activity, incoming_set, visited=None):
+        if visited is None:
+            visited = set()
+        
+        if activity in visited:
+            return  # Prevent infinite recursion on cycles
+        visited.add(activity)
+        
+        if not activity.startswith('tau'):
+            incoming_set.add(activity)
+        else:
+            for pred in self.predecessors.get(activity, []):
+                self._add_non_tau_predecessors(pred, incoming_set, visited)
+
+    def compute_decision_points_probabilities(self):
+        place_outgoing_transitions = self._get_place_outgoing_transitions()
+        
+        decision_points = {}
+        for place, transitions in place_outgoing_transitions.items():
+            if len(transitions) > 1:
+                decision_points[place] = transitions
+
+        df_counts = self._compute_activity_frequencies()
+        decision_probabilities = self._compute_decision_probabilities(decision_points, df_counts)
+
+        return decision_probabilities
+        
+        
+    def identify_parallels(self):
+        """
+        Identifies transitions that split into parallel paths (AND-splits).
+        Returns a dictionary mapping parallel-splitting transitions to their subsequent transitions.
+        
+        A parallel split (AND-split) occurs when:
+        1. A transition has multiple outgoing places
+        2. Each of these places leads to different subsequent transitions
+        3. All these paths will eventually be executed (not an exclusive choice)
+        """
+        place_outgoing_transitions = self._get_place_outgoing_transitions()
+        transition_outgoing_places = self._get_transition_outgoing_places()
+        
+        decision_point_places = self._identify_decision_point_places(place_outgoing_transitions)
+        
+        return self._extract_parallel_patterns(transition_outgoing_places, place_outgoing_transitions, decision_point_places)
+
+    def _identify_decision_point_places(self, place_outgoing_transitions):
+        decision_point_places = set()
+        for place, transitions in place_outgoing_transitions.items():
+            if len(transitions) > 1:
+                decision_point_places.add(place)
+        return decision_point_places
+
+    def _extract_parallel_patterns(self, transition_outgoing_places, place_outgoing_transitions, decision_point_places):
+        parallels = {}
+        for transition, places in transition_outgoing_places.items():
+            if len(places) >= 2:
+                # Skip transitions that lead to decision points (exclusive choices)
+                if any(place in decision_point_places for place in places):
+                    continue
+                
+                subsequent_transitions = self._get_subsequent_transitions(places, place_outgoing_transitions)
+                unique_subsequent_labels = set(self._get_activity_name_for_transition(t) for t in subsequent_transitions)
+                
+                if len(unique_subsequent_labels) >= 2:
+                    transition_key = self._get_activity_name_for_transition(transition)
+                    parallels[transition_key] = [
+                        self._get_activity_name_for_transition(t) for t in subsequent_transitions
+                    ]
+        
+        return parallels
+
+    def _get_subsequent_transitions(self, places, place_outgoing_transitions):
+        subsequent_transitions = []
+        for place in places:
+            for next_transition in place_outgoing_transitions[place]:
+                # Include all transitions (labeled and silent)
+                subsequent_transitions.append(next_transition)
+        return subsequent_transitions
+    
+
+    def extract_predecessors(self):
+        place_to_inputs = self._build_place_input_mapping()
+        predecessors = self._build_predecessor_mapping(place_to_inputs)
+        return {k: list(set(v)) for k, v in predecessors.items()}
+
+    def _build_place_input_mapping(self):
+        place_to_inputs = defaultdict(list)
+        for arc in self.edges:
+            if isinstance(arc.source, pm4py.objects.petri_net.obj.PetriNet.Transition) and \
+               isinstance(arc.target, pm4py.objects.petri_net.obj.PetriNet.Place):
+                place_to_inputs[arc.target].append(arc.source)
+        return place_to_inputs
+
+    def _get_activity_name_for_transition(self, transition):
+        """Get the activity name for a transition, handling silent transitions."""
+        if transition.label is not None:
+            return utils.sanitize_name(transition.label)
+        else:
+            # Find the tau name for this silent transition
+            for silent_transition, tau_name in self.silent_transitions:
+                if silent_transition == transition:
+                    return tau_name
+            # If not found, create a new tau name (shouldn't happen if _extract_basic_properties ran)
+            return f"tau_unknown_{id(transition)}"
+
+    def _build_predecessor_mapping(self, place_to_inputs):
+        """Build predecessor mapping from place-input mapping."""
+        predecessors = defaultdict(list)
+        for arc in self.edges:
+            if (isinstance(arc.source, pm4py.objects.petri_net.obj.PetriNet.Place) and \
+                isinstance(arc.target, pm4py.objects.petri_net.obj.PetriNet.Transition)):
+                
+                target_activity = self._get_activity_name_for_transition(arc.target)
+                for input_transition in place_to_inputs[arc.source]:
+                    input_activity = self._get_activity_name_for_transition(input_transition)
+                    predecessors[target_activity].append(input_activity)
+        return predecessors
+
+
+    def discover_attribute_activity_relationships(self):
+        relationships = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        for trace in self.full_log:
+            for i in range(len(trace) - 1):
+                current_event = trace[i]
+                next_event = trace[i+1]
+                next_activity = next_event['concept:name']
+                source_activity = current_event['concept:name']
+                sanitized_source = utils.sanitize_name(source_activity)
+                sanitized_target = utils.sanitize_name(next_activity)
+                
+                if sanitized_target in self.predecessors and sanitized_source in self.predecessors[sanitized_target]:
+                    for attr, val in current_event.items():
+                        if attr in self.IGNORED_ATTRIBUTES:
+                            continue
+                        
+                        sanitized_attr = utils.sanitize_name(attr)
+                        relationships[sanitized_attr][str(val)][sanitized_target] += 1
+        significant_relationships = {}
+        for attr, values in relationships.items():
+            if len(values) <= 1:
+                continue
+            common_activities = set.intersection(*[set(activities.keys()) for activities in values.values()])
+            non_discriminative = {activity for activity in common_activities 
+                                 if all(activities[activity] / sum(activities.values()) >= self.STRONG_PROBABILITY_THRESHOLD 
+                                       for activities in values.values())}
+            significant_attr_relationships = {}
+            
+            for val, activities in values.items():
+                total = sum(activities.values())
+                if total >= self.MIN_SUPPORT_FOR_RELATIONSHIPS:
+                    significant_activities = {
+                        activity: {'count': count, 'probability': count/total}
+                        for activity, count in activities.items()
+                        if activity not in non_discriminative and count/total >= 0.2
+                    }
+                    if significant_activities:
+                        significant_attr_relationships[val] = significant_activities
+            
+            if significant_attr_relationships:
+                significant_relationships[attr] = significant_attr_relationships
+        
+        return significant_relationships
+    
+
+    def discover_activity_attribute_effects(self):
+        """
+        Discover how activities affect attribute values, including capturing actual values
+        for new attribute introductions. Considers only valid transitions in the Petri net.
+        
+        Returns:
+            dict: Mapping showing how activities tend to affect attribute values
+        """
+        effects = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(int))))
+        new_value_introductions = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        valid_transitions = self._get_valid_transitions()
+        
+        self._collect_attribute_effects(effects, new_value_introductions, valid_transitions)
+        
+        return self._build_significant_effects(effects, new_value_introductions)
+
+    def _get_valid_transitions(self):
+        valid_transitions = set()
+        for target_activity, source_activities in self.predecessors.items():
+            for source_activity in source_activities:
+                valid_transitions.add((source_activity, target_activity))
+        return valid_transitions
+
+    def _collect_attribute_effects(self, effects, new_value_introductions, valid_transitions):
+        for trace in self.full_log:
+            attributes_seen_in_trace = set()
+            prev_event = None
+            
+            for event in trace:
+                activity = event['concept:name']
+                sanitized_activity = utils.sanitize_name(activity)
+                self._track_new_attribute_introductions(
+                    event, sanitized_activity, attributes_seen_in_trace, new_value_introductions
+                )
+                if prev_event is not None:
+                    self._track_attribute_changes(
+                        prev_event, event, sanitized_activity, valid_transitions, effects
+                    )
+                
+                prev_event = event
+
+    def _track_new_attribute_introductions(self, event, sanitized_activity, attributes_seen_in_trace, new_value_introductions):
+        for attr, val in event.items():
+            if attr in self.IGNORED_ATTRIBUTES:
+                continue
+            sanitized_attr = utils.sanitize_name(attr)
+            if sanitized_attr not in attributes_seen_in_trace:
+                discretized_val = utils.discretize_value(sanitized_attr, val, self.intervals)
+                new_value_introductions[sanitized_activity][sanitized_attr][discretized_val] += 1
+                attributes_seen_in_trace.add(sanitized_attr)
+
+    def _track_attribute_changes(self, prev_event, event, sanitized_activity, valid_transitions, effects):
+        prev_activity = prev_event['concept:name']
+        sanitized_prev_activity = utils.sanitize_name(prev_activity)
+        
+        if (sanitized_prev_activity, sanitized_activity) not in valid_transitions:
+            return
+        
+        # Look for attribute values that changed after the previous activity
+        for attr in set(prev_event.keys()).union(event.keys()):
+            if attr in self.IGNORED_ATTRIBUTES:
+                continue
+                
+            prev_val = prev_event.get(attr)
+            curr_val = event.get(attr)
+            if prev_val is None or curr_val is None or prev_val == curr_val:
+                continue
+                
+            sanitized_attr = utils.sanitize_name(attr)
+            prev_val_str = str(prev_val).lower() if isinstance(prev_val, bool) else str(prev_val)
+            curr_val_str = str(curr_val).lower() if isinstance(curr_val, bool) else str(curr_val)
+            effects[sanitized_prev_activity][sanitized_attr][prev_val_str][curr_val_str] += 1
+
+    def _build_significant_effects(self, effects, new_value_introductions):
+        significant_effects = {}
+        for activity, attributes in effects.items():
+            significant_effects[activity] = {}
+            for attr, from_values in attributes.items():
+                significant_from_values = self._filter_significant_transitions(from_values)
+                if significant_from_values:
+                    significant_effects[activity][attr] = significant_from_values
+        for activity, attributes in new_value_introductions.items():
+            if activity not in significant_effects:
+                significant_effects[activity] = {}
+            
+            for attr, values in attributes.items():
+                total_introductions = sum(values.values())
+                if total_introductions >= 1:
+                    if attr not in significant_effects[activity]:
+                        significant_effects[activity][attr] = {}
+                    
+                    significant_effects[activity][attr]['NEW'] = {}
+                    for val, count in values.items():
+                        probability = count / total_introductions
+                        if probability >= self.MIN_PROBABILITY_THRESHOLD:
+                            significant_effects[activity][attr]['NEW'][val] = {
+                                'count': count,
+                                'probability': probability
+                            }
+        
+        return significant_effects
+
+    def _filter_significant_transitions(self, from_values):
+        significant_from_values = {}
+        
+        for from_val, to_values in from_values.items():
+            total_transitions = sum(to_values.values())
+            if total_transitions >= self.MIN_SUPPORT_COUNT:
+                significant_to_values = {}
+                for to_val, count in to_values.items():
+                    probability = count / total_transitions
+                    if probability >= self.MIN_PROBABILITY_THRESHOLD:
+                        significant_to_values[to_val] = {
+                            'count': count,
+                            'probability': probability
+                        }
+                
+                if significant_to_values:
+                    significant_from_values[from_val] = significant_to_values
+        
+        return significant_from_values
+
+    def _build_direct_transition_graph(self):
+        """
+        Build a direct transition graph by removing places and connecting transitions directly.
+        Silent transitions are included as explicit nodes.
+        Returns a dict: {transition: [next_transition, ...]}
+        """
+        graph = defaultdict(list)
+        place_incoming_transitions = self._get_place_incoming_transitions()
+        place_outgoing_transitions = self._get_place_outgoing_transitions()
+        
+        for place in self.places:
+            incoming_transitions = place_incoming_transitions.get(place, [])
+            outgoing_transitions = place_outgoing_transitions.get(place, [])
+            
+            if not incoming_transitions or not outgoing_transitions:
+                continue
+            
+            # For each incoming transition, connect to all outgoing transitions
+            for incoming_t in incoming_transitions:
+                incoming_activity = self._get_activity_name_for_transition(incoming_t)
+                
+                for outgoing_t in outgoing_transitions:
+                    outgoing_activity = self._get_activity_name_for_transition(outgoing_t)
+                    graph[incoming_activity].append(outgoing_activity)
+        
+        return dict(graph)
+
+
+    def _get_place_incoming_transitions(self):
+        place_incoming_transitions = defaultdict(list)
+        for arc in self.edges:
+            if isinstance(arc.target, pm4py.objects.petri_net.obj.PetriNet.Place) and \
+               isinstance(arc.source, pm4py.objects.petri_net.obj.PetriNet.Transition):
+                place_incoming_transitions[arc.target].append(arc.source)
+        return place_incoming_transitions
