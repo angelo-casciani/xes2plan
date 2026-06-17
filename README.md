@@ -1,4 +1,4 @@
-# XES2Plan: Enable Predictive Process Monitoring through Automated Planning 
+# Predictive Process Monitoring via Automated Planning 
 Source code, event log presented in the case study, and instructions for using the framework presented in the paper "[Predictive Process Monitoring via Automated Planning](https://link.springer.com/chapter/10.1007/978-3-032-27997-2_16)".
 
 ## About
