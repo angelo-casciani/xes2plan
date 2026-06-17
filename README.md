@@ -1,5 +1,5 @@
 # XES2Plan: Enable Predictive Process Monitoring through Automated Planning 
-Source code, event log presented in the case study, and instructions for using the framework presented in the paper "Predictive Process Monitoring via Automated Planning".
+Source code, event log presented in the case study, and instructions for using the framework presented in the paper "[Predictive Process Monitoring via Automated Planning](https://link.springer.com/chapter/10.1007/978-3-032-27997-2_16)".
 
 ## About
 Predictive Process Monitoring (PPM) forecasts the future behavior of ongoing business process executions to support proactive decision-making.
@@ -427,6 +427,25 @@ evaluation/batch_results/
     └── ...
 ```
 
+## Citation
+
+If you use this repository in your research, please cite:
+
+```bibtex
+
+@inproceedings{casciani2026predictive,
+  title = {Predictive Process Monitoring via Automated Planning},
+  author={Casciani, Angelo and Giovannetti, Alessandra and Macagnano, Silvia and Marrella, Andrea and Bernardi, Mario Luca and Cimitile, Marta and Maggi, Fabrizio Maria},
+  booktitle = {Intelligent Information Systems - 38th International Conference, CAiSE 2026 Forum and Doctoral Consortium, Verona, Italy, June 8–12, 2026, Proceedings},
+  series = {Lecture Notes in Business Information Processing},
+  volume = {587},
+  pages={135--145},
+  doi = {https://doi.org/10.1007/978-3-032-27997-2_16},
+  url = {https://link.springer.com/chapter/10.1007/978-3-032-27997-2_16},
+  year = {2026},
+  publisher = {Springer}
+}
+```
 
 ## License
 Distributed under the GNU GPL License. See [LICENSE](LICENSE) for more information.
